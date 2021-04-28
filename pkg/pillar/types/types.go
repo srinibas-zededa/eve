@@ -267,3 +267,19 @@ func FormatTriState(state TriState) string {
 	}
 	return ""
 }
+
+// UUIDPairToNum used for appNum on network instance
+type UUIDPairToNum struct {
+	BaseID      uuid.UUID
+	AppID       uuid.UUID
+	Number      int
+	NumType     string
+	CreateTime  time.Time
+	LastUseTime time.Time
+	InUse       bool
+}
+
+// Key is the key in pubsub
+func (info UUIDPairToNum) Key() string {
+	return info.BaseID.String() + "-" + info.AppID.String()
+}

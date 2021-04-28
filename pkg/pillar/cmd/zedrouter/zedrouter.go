@@ -70,6 +70,7 @@ type zedrouterContext struct {
 	GCInitialized          bool
 	pubUuidToNum           pubsub.Publication
 	dhcpLeases             []dnsmasqLease
+	pubUUIDPairToNum       pubsub.Publication
 
 	// NetworkInstance
 	subNetworkInstanceConfig  pubsub.Subscription
@@ -152,6 +153,16 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	}
 	pubUuidToNum.ClearRestarted()
 
+	pubUUIDPairToNum, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName:  agentName,
+		Persistent: true,
+		TopicType:  types.UUIDPairToNum{},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	pubUUIDPairToNum.ClearRestarted()
+
 	// Create the dummy interface used to re-direct DROP/REJECT packets.
 	createFlowMonDummyInterface(DropMarkValue)
 
@@ -232,6 +243,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 
 	zedrouterCtx.deviceNetworkStatus = &types.DeviceNetworkStatus{}
 	zedrouterCtx.pubUuidToNum = pubUuidToNum
+	zedrouterCtx.pubUUIDPairToNum = pubUUIDPairToNum
 
 	// Create publish before subscribing and activating subscriptions
 	// Also need to do this before we wait for IP addresses since
@@ -395,6 +407,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	appNumAllocatorInit(&zedrouterCtx)
 	bridgeNumAllocatorInit(&zedrouterCtx)
 	handleInit(runDirname)
+	appNumOnUNetInit(&zedrouterCtx)
 
 	// Before we process any NetworkInstances we want to know the
 	// assignable adapters.
@@ -534,6 +547,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			start := time.Now()
 			bridgeNumAllocatorGC(&zedrouterCtx)
 			appNumAllocatorGC(&zedrouterCtx)
+			appNumMapOnUNetGC(&zedrouterCtx)
 			zedrouterCtx.triggerNumGC = false
 			ps.CheckMaxTimeTopic(agentName, "allocatorGC", start,
 				warningTime, errorTime)
@@ -673,6 +687,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			start := time.Now()
 			bridgeNumAllocatorGC(&zedrouterCtx)
 			appNumAllocatorGC(&zedrouterCtx)
+			appNumMapOnUNetGC(&zedrouterCtx)
 			zedrouterCtx.triggerNumGC = false
 			ps.CheckMaxTimeTopic(agentName, "allocatorGC", start,
 				warningTime, errorTime)
@@ -842,6 +857,9 @@ func handleAppNetworkCreate(ctxArg interface{}, key string, configArg interface{
 	}
 	publishAppNetworkStatus(ctx, &status)
 
+	// allocate application numbers on underlay network
+	appNumsOnUNetAllocate(ctx, &config)
+
 	if config.Activate {
 		doActivate(ctx, config, &status)
 	}
@@ -918,7 +936,6 @@ func appNetworkDoActivateAllUnderlayNetworks(
 			ulNum, ulConfig.Network.String(), ulConfig.ACLs)
 		err := appNetworkDoActivateUnderlayNetwork(
 			ctx, config, status, ipsets, &ulConfig, ulNum)
-
 		if err != nil {
 			return err
 		}
@@ -1014,15 +1031,16 @@ func appNetworkDoActivateUnderlayNetwork(
 		}
 	}
 
-	bridgeIPAddr, appIPAddr, err := getUlAddrs(ctx, ulNum-1,
-		status.AppNum, ulStatus, netInstStatus)
+	appID := status.UUIDandVersion.UUID
+	appIPAddr, err := getUlAddrs(ctx, ulNum-1, netInstStatus, ulStatus,
+		appID)
 	if err != nil {
-		err := fmt.Errorf("Bridge/App IP address allocation failed: %v",
-			err)
+		err := fmt.Errorf("App IP address allocation failed: %v", err)
 		log.Error(err.Error())
 		addError(ctx, status, "getUlAddrs", err)
 		return err
 	}
+	bridgeIPAddr := netInstStatus.BridgeIPAddr
 	log.Functionf("bridgeIPAddr %s appIPAddr %s\n", bridgeIPAddr, appIPAddr)
 	ulStatus.BridgeIPAddr = bridgeIPAddr
 	// appIPAddr is "" for switch NI. DHCP snoop will set AllocatedIPAddr later
@@ -1050,7 +1068,6 @@ func appNetworkDoActivateUnderlayNetwork(
 		addError(ctx, status, "createACL", err)
 		return err
 	}
-	appID := status.UUIDandVersion.UUID
 	setNetworkACLRules(ctx, appID, ulStatus.Name, ruleList)
 
 	if appIPAddr != "" {
@@ -1242,59 +1259,82 @@ func findBridge(bridgeName string) (*netlink.Bridge, error) {
 }
 
 // XXX Need additional logic for IPv6 underlays.
-func getUlAddrs(ctx *zedrouterContext,
-	ifnum int, appNum int,
-	status *types.UnderlayNetworkStatus,
-	netInstStatus *types.NetworkInstanceStatus) (string, string, error) {
-
-	log.Functionf("getUlAddrs(%d/%d)\n", ifnum, appNum)
-
-	bridgeIPAddr := ""
-	appIPAddr := ""
-
-	// Allocate bridgeIPAddr based on BridgeMac
-	log.Functionf("getUlAddrs(%d/%d for %s) bridgeMac %s\n",
-		ifnum, appNum, netInstStatus.UUID.String(),
-		status.BridgeMac.String())
+func getUlAddrs(ctx *zedrouterContext, ifnum int,
+	netInstStatus *types.NetworkInstanceStatus,
+	ulStatus *types.UnderlayNetworkStatus, appID uuid.UUID) (string, error) {
 	var err error
-	var addr string
-	addr, err = lookupOrAllocateIPv4(ctx, netInstStatus,
-		status.BridgeMac)
+	var mac net.HardwareAddr
+	networkID := netInstStatus.UUID
+
+	if netInstStatus.Subnet.IP == nil ||
+		netInstStatus.DhcpRange.Start == nil {
+		log.Functionf("getUlAddrs(%d/%s) no subnet %s\n",
+			ifnum, networkID.String(), appID.String())
+		return "", nil
+	}
+	if ulStatus.Mac == "" {
+		log.Functionf("getUlAddrs(%d/%s) no mac %s\n",
+			ifnum, networkID.String(), appID.String())
+		return "", nil
+	}
+	log.Functionf("getUlAddrs(%d) for %s/%s\n", ifnum,
+		networkID.String(), appID.String())
+
+	// XXX or change type of VifInfo.Mac to avoid parsing?
+	mac, err = net.ParseMAC(ulStatus.Mac)
 	if err != nil {
-		log.Errorf("getUlAddrs: Bridge IP address allocation failed %s\n", err)
-		return bridgeIPAddr, appIPAddr, err
-	} else {
-		bridgeIPAddr = addr
+		errStr := fmt.Sprintf("parse Mac fail: %v\n", err)
+		log.Errorf("getUlAddrs(%s, %s): fail: %s\n",
+			networkID.String(), appID.String(), err)
+		return "", errors.New(errStr)
 	}
 
-	if status.AppIPAddr != nil {
-		// Static IP assignment case.
-		// Note that appIPAddr can be in a different subnet.
-		// Assumption is that the config specifies a gateway/router
-		// in the same subnet as the static address.
-		appIPAddr = status.AppIPAddr.String()
-		recordIPAssignment(ctx, netInstStatus, status.AppIPAddr,
-			status.Mac)
-	} else if status.Mac != "" {
-		// XXX or change type of VifInfo.Mac to avoid parsing?
-		var mac net.HardwareAddr
-		mac, err = net.ParseMAC(status.Mac)
-		if err != nil {
-			log.Fatal("ParseMAC failed: ", status.Mac, err)
+	ipAddr := ""
+	// for static IP Address
+	if ulStatus.AppIPAddr != nil {
+		ipAddr = ulStatus.AppIPAddr.String()
+		// the IP Address, should not be in dhcpRange
+		if netInstStatus.DhcpRange.Contains(ulStatus.AppIPAddr) {
+			errStr := fmt.Sprintf("static IP(%s) is in DhcpRange(%s, %s)",
+				ipAddr, netInstStatus.DhcpRange.Start.String(),
+				netInstStatus.DhcpRange.End.String())
+			log.Errorf("getUlAddrs(%s, %s): fail: %s",
+				networkID.String(), appID.String(), errStr)
+			return "", errors.New(errStr)
 		}
-		log.Functionf("getUlAddrs(%d/%d for %s) app Mac %s\n",
-			ifnum, appNum, netInstStatus.UUID.String(), mac.String())
-		addr, err = lookupOrAllocateIPv4(ctx, netInstStatus, mac)
+		// IP Address must be inside the subnet range
+		if !netInstStatus.Subnet.Contains(ulStatus.AppIPAddr) {
+			errStr := fmt.Sprintf("out of subnet range(%s)", ipAddr)
+			log.Errorf("getUlAddrs(%s, %s): fail: %s",
+				networkID.String(), appID.String(), errStr)
+			return "", errors.New(errStr)
+		}
+	} else {
+		// get the app number for the underlay network entry
+		appNum, err := appNumOnUNetGet(ctx, networkID, appID)
+		if appNum == types.AppNumInvalid || err != nil {
+			errStr := fmt.Sprintf("App Number get failed: %v", err)
+			log.Errorf("getUlAddrs(%s, %s): fail: %s",
+				networkID.String(), appID.String(), errStr)
+			return "", errors.New(errStr)
+		}
+		ipAddr, err = lookupOrAllocateIPv4(netInstStatus, appID, appNum, mac)
 		if err != nil {
-			log.Errorf("getUlAddrs: App IP address allocation failed: %s\n", err)
-			return bridgeIPAddr, appIPAddr, err
-		} else {
-			appIPAddr = addr
+			errStr := fmt.Sprintf("IP Addr get fail: %v", err)
+			log.Errorf("getUlAddrs(%s%s): fail:%s",
+				networkID.String(), appID.String(), errStr)
+			log.Errorf("getUlAddrs(%s, %s): fail: %s",
+				networkID.String(), appID.String(), errStr)
+			return "", errors.New(errStr)
 		}
 	}
-	log.Functionf("getUlAddrs(%d/%d) done %s/%s\n",
-		ifnum, appNum, bridgeIPAddr, appIPAddr)
-	return bridgeIPAddr, appIPAddr, err
+	addr := net.ParseIP(ipAddr)
+	ulStatus.BridgeIPAddr = netInstStatus.BridgeIPAddr
+	recordIPAssignment(ctx, netInstStatus, addr, ulStatus.Mac)
+	publishNetworkInstanceStatus(ctx, netInstStatus)
+	log.Functionf("getUlAddrs(%d/%s) done %s, ipAddr: %s",
+		ifnum, networkID.String(), appID.String(), ipAddr)
+	return ipAddr, nil
 }
 
 // Caller should clear the appropriate status.Pending* if the the caller will
@@ -1337,6 +1377,9 @@ func handleAppNetworkModify(ctxArg interface{}, key string,
 			config.DisplayName, err)
 		return
 	}
+
+	// allocate application numbers on underlay network
+	appNumsOnUNetAllocate(ctx, &config)
 
 	// No check for version numbers since the ACLs etc might change
 	// even for the same version.
@@ -1564,6 +1607,7 @@ func handleDelete(ctx *zedrouterContext, key string,
 	unpublishAppNetworkStatus(ctx, status)
 
 	appNumFree(ctx, status.UUIDandVersion.UUID)
+	appNumsOnUNetFree(ctx, status)
 	log.Functionf("handleDelete done for %s\n", status.DisplayName)
 }
 
@@ -1595,13 +1639,13 @@ func appNetworkDoInactivateAllUnderlayNetworks(
 	status *types.AppNetworkStatus,
 	ipsets []string) {
 
+	appID := status.UUIDandVersion.UUID
 	for ulNum := 0; ulNum < len(status.UnderlayNetworkList); ulNum++ {
 		ulStatus := &status.UnderlayNetworkList[ulNum]
 		log.Functionf("doInactivate ulNum %d: %v\n", ulNum, ulStatus)
 		appNetworkDoInactivateUnderlayNetwork(
 			ctx, status, ulStatus, ipsets)
 	}
-	appID := status.UUIDandVersion.UUID
 	delete(ctx.NLaclMap, appID)
 }
 
@@ -1658,8 +1702,8 @@ func appNetworkDoInactivateUnderlayNetwork(
 		VifName: ulStatus.Vif, BridgeIP: ulStatus.BridgeIPAddr, AppIP: appIPAddr,
 		UpLinks: netstatus.IfNameList}
 
-	// XXX Could ulStatus.Vif not be set? Means we didn't add
 	appID := status.UUIDandVersion.UUID
+	// XXX Could ulStatus.Vif not be set? Means we didn't add
 	if ulStatus.Vif != "" {
 		rules := getNetworkACLRules(ctx, appID, ulStatus.Name)
 		ruleList, err := deleteACLConfiglet(aclArgs, rules.ACLRules)
@@ -2227,14 +2271,14 @@ func doDnsmasqRestart(ctx *zedrouterContext) {
 }
 
 // XXX: Dead code. May be useful when we do wireguard/tailscale
-func deleteAppInstaneOverlayRoute(
+func deleteAppInstanceOverlayRoute(
 	ctx *zedrouterContext,
 	status *types.AppNetworkStatus) {
 	bridgeName := "" // XXX Fill bridge name
 	oLink, err := findBridge(bridgeName)
 	if err != nil {
 		addError(ctx, status, "findBridge", err)
-		log.Functionf("deleteAppInstaneOverlayRoute done for %s\n",
+		log.Functionf("deleteAppInstanceOverlayRoute done for %s\n",
 			status.DisplayName)
 		return
 	}
@@ -2251,9 +2295,9 @@ func deleteAppInstaneOverlayRoute(
 	if err != nil {
 		errStr := fmt.Sprintf("ParseCIDR %s failed: %v",
 			EID.String()+subnetSuffix, err)
-		addError(ctx, status, "deleteAppInstaneOverlayRoute",
+		addError(ctx, status, "deleteAppInstanceOverlayRoute",
 			errors.New(errStr))
-		log.Functionf("deleteAppInstaneOverlayRoute done for %s\n",
+		log.Functionf("deleteAppInstanceOverlayRoute done for %s\n",
 			status.DisplayName)
 		return
 	}
@@ -2261,9 +2305,9 @@ func deleteAppInstaneOverlayRoute(
 	if err := netlink.RouteDel(&rt); err != nil {
 		errStr := fmt.Sprintf("RouteDelete %s failed: %s",
 			EID, err)
-		addError(ctx, status, "deleteAppInstaneOverlayRoute",
+		addError(ctx, status, "deleteAppInstanceOverlayRoute",
 			errors.New(errStr))
-		log.Functionf("deleteAppInstaneOverlayRoute done for %s\n",
+		log.Functionf("deleteAppInstanceOverlayRoute done for %s\n",
 			status.DisplayName)
 	}
 }

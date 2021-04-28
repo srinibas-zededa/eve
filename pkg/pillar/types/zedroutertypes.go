@@ -4,6 +4,7 @@
 package types
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -1870,6 +1871,38 @@ type NetworkXObjectConfig struct {
 type IpRange struct {
 	Start net.IP
 	End   net.IP
+	Size  int
+}
+
+// Contains used to evaluate whether an IP address
+// is within the range
+func (ipRange IpRange) Contains(ipAddr net.IP) bool {
+	start := ipRange.Start.To4()
+	end := ipRange.End.To4()
+	cur := ipAddr.To4()
+	if bytes.Compare(cur, start) >= 0 &&
+		bytes.Compare(cur, end) <= 0 {
+		return true
+	}
+	return false
+}
+
+// HostCount used to count the number of hosts
+func (ipRange IpRange) HostCount() int {
+	addr1 := ipRange.Start.To4()
+	if addr1 != nil {
+		addr2 := ipRange.End.To4()
+		if addr2 != nil {
+			start := uint(addr1[0])<<24 + uint(addr1[1])<<16 +
+				uint(addr1[2])<<8 + uint(addr1[3])
+			end := uint(addr2[0])<<24 + uint(addr2[1])<<16 +
+				uint(addr2[2])<<8 + uint(addr2[3])
+			addrCount := int(end + 1 - start)
+			return addrCount
+		}
+	}
+	// TBD:XXX IPv6 handling
+	return 0
 }
 
 func (config NetworkXObjectConfig) Key() string {
@@ -2889,3 +2922,102 @@ func (status OnboardingStatus) LogDelete(logBase *base.LogObject) {
 func (status OnboardingStatus) LogKey() string {
 	return string(base.OnboardingStatusLogType) + "-" + status.Key()
 }
+
+// Bitmap :
+// Bitmap of the reserved and allocated resources
+// Keeps 256 bits indexed by 0 to 255.
+type Bitmap [32]byte
+
+// IsSet :
+// Test the bit value
+func (bits *Bitmap) IsSet(i int) bool {
+	return bits[i/8]&(1<<uint(7-i%8)) != 0
+}
+
+// Set :
+// Set the bit value
+func (bits *Bitmap) Set(i int) {
+	bits[i/8] |= 1 << uint(7-i%8)
+}
+
+// Clear :
+// Clear the bit value
+func (bits *Bitmap) Clear(i int) {
+	bits[i/8] &^= 1 << uint(7-i%8)
+}
+
+// AddToIP :
+func AddToIP(ip net.IP, addition int) net.IP {
+	if addr := ip.To4(); addr != nil {
+		val := uint32(addr[0])<<24 + uint32(addr[1])<<16 +
+			uint32(addr[2])<<8 + uint32(addr[3])
+		val += uint32(addition)
+		byte0 := byte((val >> 24) & 0xFF)
+		byte1 := byte((val >> 16) & 0xFF)
+		byte2 := byte((val >> 8) & 0xFF)
+		byte3 := byte(val & 0xFF)
+		return net.IPv4(byte0, byte1, byte2, byte3)
+	}
+	//TBD:XXX, IPv6 handling
+	return net.IP{}
+}
+
+// GetIPSubnetBase :
+func GetIPSubnetBase(ip, gateway net.IP) int {
+	if addr := ip.To4(); addr != nil {
+		val0 := uint32(addr[0])<<24 + uint32(addr[1])<<16 +
+			uint32(addr[2])<<8 + uint32(addr[3])
+		if gateway == nil {
+			return 0
+		}
+		addr = gateway.To4()
+		if addr == nil {
+			return 0
+		}
+		val1 := uint32(addr[0])<<24 + uint32(addr[1])<<16 +
+			uint32(addr[2])<<8 + uint32(addr[3])
+		return int(val1 - val0)
+	}
+	//TBD:XXX, IPv6 handling
+	return 0
+}
+
+// GetIPAddrCountOnSubnet IP address count on subnet
+func GetIPAddrCountOnSubnet(subnet net.IPNet) int {
+	prefixLen, _ := subnet.Mask.Size()
+	if prefixLen != 0 {
+		if subnet.IP.To4() != nil {
+			return 0x01 << (32 - prefixLen)
+		}
+		if subnet.IP.To16() != nil {
+			return 0x01 << (128 - prefixLen)
+		}
+	}
+	return 0
+}
+
+// GetIPNetwork  :
+func GetIPNetwork(subnet net.IPNet) net.IP {
+	return subnet.IP.Mask(subnet.Mask)
+}
+
+// GetIPBroadcast :
+func GetIPBroadcast(subnet net.IPNet) net.IP {
+	if network := GetIPNetwork(subnet); network != nil {
+		if addrCount := GetIPAddrCountOnSubnet(subnet); addrCount != 0 {
+			return AddToIP(network, addrCount-1)
+		}
+	}
+	return net.IP{}
+}
+
+// AppNumber :
+// PS. Any change to AppNumMax, must be
+// reflected in the BitMap Size(8 bytes)
+const (
+	AppNumStart   = 0   // DhcpRange start
+	AppNumEnd     = 252 // DhcpRange end
+	AppNumMax     = 253 // Max Count
+	LargeAppCount = 16  // to determine the default Dhcp Range
+	AppNumInvalid = 255
+)

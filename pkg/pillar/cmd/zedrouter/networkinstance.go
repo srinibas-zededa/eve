@@ -6,7 +6,6 @@
 package zedrouter
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -265,7 +264,6 @@ func handleNetworkInstanceModify(
 	oldConfigArg interface{}) {
 
 	ctx := ctxArg.(*zedrouterContext)
-	pub := ctx.pubNetworkInstanceStatus
 	config := configArg.(types.NetworkInstanceConfig)
 	status := lookupNetworkInstanceStatus(ctx, key)
 	if status != nil {
@@ -281,7 +279,7 @@ func handleNetworkInstanceModify(
 			log.Functionf("handleNetworkInstanceModify(%s) done\n", key)
 			return
 		}
-		pub.Publish(status.Key(), *status)
+		publishNetworkInstanceStatus(ctx, status)
 		doNetworkInstanceModify(ctx, config, status)
 		niUpdateNIprobing(ctx, status)
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
@@ -303,7 +301,6 @@ func handleNetworkInstanceCreate(
 	log.Functionf("handleNetworkInstanceCreate: (UUID: %s, name:%s)\n",
 		key, config.DisplayName)
 
-	pub := ctx.pubNetworkInstanceStatus
 	status := types.NetworkInstanceStatus{
 		NetworkInstanceConfig: config,
 		NetworkInstanceInfo: types.NetworkInstanceInfo{
@@ -312,6 +309,8 @@ func handleNetworkInstanceCreate(
 			VlanMap:       make(map[uint32]uint32),
 		},
 	}
+	appNumOnUNetBaseCreate(status.UUID)
+	status.DhcpRange.Size = getAppCountOnUNet(ctx, &status)
 	status.ChangeInProgress = types.ChangeInProgressTypeCreate
 
 	// Any error from parser?
@@ -326,7 +325,7 @@ func handleNetworkInstanceCreate(
 	}
 
 	ctx.networkInstanceStatusMap[status.UUID] = &status
-	pub.Publish(status.Key(), status)
+	publishNetworkInstanceStatus(ctx, &status)
 
 	status.PInfo = make(map[string]types.ProbeInfo)
 	niUpdateNIprobing(ctx, &status)
@@ -341,7 +340,7 @@ func handleNetworkInstanceCreate(
 		publishNetworkInstanceStatus(ctx, &status)
 		return
 	}
-	pub.Publish(status.Key(), status)
+	publishNetworkInstanceStatus(ctx, &status)
 
 	if config.Activate {
 		log.Functionf("handleNetworkInstanceCreate: Activating network instance")
@@ -380,6 +379,7 @@ func handleNetworkInstanceDelete(ctxArg interface{}, key string,
 		doNetworkInstanceInactivate(ctx, status)
 	}
 	doNetworkInstanceDelete(ctx, status)
+	appNumOnUNetBaseDelete(status.UUID)
 	delete(ctx.networkInstanceStatusMap, status.UUID)
 	pub.Unpublish(status.Key())
 
@@ -391,11 +391,11 @@ func doNetworkInstanceCreate(ctx *zedrouterContext,
 	status *types.NetworkInstanceStatus) error {
 
 	log.Functionf("NetworkInstance(%s-%s): NetworkType: %d, IpType: %d\n",
-		status.DisplayName, status.UUID, status.Type, status.IpType)
+		status.DisplayName, status.Key(), status.Type, status.IpType)
 
 	if err := doNetworkInstanceSanityCheck(ctx, status); err != nil {
 		log.Errorf("NetworkInstance(%s-%s): Sanity Check failed: %s",
-			status.DisplayName, status.UUID, err)
+			status.DisplayName, status.Key(), err)
 		return err
 	}
 
@@ -554,7 +554,7 @@ func doNetworkInstanceSanityCheck(
 				status.Gateway)
 			return errors.New(err)
 		}
-		err = DoNetworkInstanceStatusDhcpRangeSanityCheck(status)
+		err = doNetworkInstanceStatusDhcpRangeSanityCheck(status)
 		if err != nil {
 			return err
 		}
@@ -614,10 +614,10 @@ func doNetworkInstanceSubnetSanityCheck(
 	return nil
 }
 
-// DoDhcpRangeSanityCheck
+// doNetworkInstanceStatusDhcpRangeSanityCheck
 // 1) Must always be Unspecified
 // 2) It should be a subset of Subnet
-func DoNetworkInstanceStatusDhcpRangeSanityCheck(
+func doNetworkInstanceStatusDhcpRangeSanityCheck(
 	status *types.NetworkInstanceStatus) error {
 	// For Mesh type network instance with Crypto V6 addressing, no dhcp-range
 	// will be specified.
@@ -796,28 +796,22 @@ func createHostDnsmasqFile(ctx *zedrouterContext, bridge string) {
 	}
 }
 
-// Returns an IP address as a string, or "" if not found.
-func lookupOrAllocateIPv4(
-	ctx *zedrouterContext,
-	status *types.NetworkInstanceStatus,
-	mac net.HardwareAddr) (string, error) {
+// Returns an IP address as a string, or "" on error
+func lookupOrAllocateIPv4(status *types.NetworkInstanceStatus,
+	appID uuid.UUID, appNum int, mac net.HardwareAddr) (string, error) {
+	log.Functionf("lookupOrAllocateIPv4(%s-%s): appNum:%d\n",
+		status.DisplayName, status.Key(), appNum)
 
-	log.Functionf("lookupOrAllocateIPv4(%s-%s): mac:%s\n",
-		status.DisplayName, status.Key(), mac.String())
-	// Lookup to see if it exists
+	networkID := status.UUIDandVersion.UUID
+	// if it exists
 	if ip, ok := status.IPAssignments[mac.String()]; ok {
-		log.Functionf("found Ip addr ( %s) for mac(%s)\n",
-			ip.String(), mac.String())
+		log.Functionf("lookupOrAllocateIPv4(%s-%s): found %s for %s\n",
+			networkID.String(), appID.String(), ip.String(), mac.String())
 		return ip.String(), nil
 	}
-
-	log.Functionf("bridgeName %s Subnet %v range %v-%v\n",
-		status.BridgeName, status.Subnet,
-		status.DhcpRange.Start.String(), status.DhcpRange.End.String())
-
 	if status.DhcpRange.Start == nil {
 		if status.Type == types.NetworkInstanceTypeSwitch {
-			log.Functionf("%s-%s switch means no bridgeIpAddr",
+			log.Functionf("%s-%s switch means no IPAddr",
 				status.DisplayName, status.Key())
 			return "", nil
 		}
@@ -825,60 +819,28 @@ func lookupOrAllocateIPv4(
 			status.DisplayName, status.Key())
 	}
 
-	// Starting guess based on number allocated
-	allocated := uint(len(status.IPAssignments))
-	if status.Gateway != nil {
-		// With Gateway present in network instance status,
-		// we would have used that as our Bridge IP address and not
-		// allocated new one. Since bridge IP address is also stored
-		// as part of IPAssignments, the actual allocated IP address
-		// numner is 1 less than the length of IPAssignments map size.
-		allocated--
-	}
-	a := addToIP(status.DhcpRange.Start, allocated)
-	for status.DhcpRange.End == nil ||
-		bytes.Compare(a, status.DhcpRange.End) <= 0 {
+	// get ip address
+	a := types.AddToIP(status.DhcpRange.Start, appNum)
 
-		log.Functionf("lookupOrAllocateIPv4(%s) testing %s\n",
-			mac.String(), a.String())
-		if status.IsIpAssigned(a) {
-			a = addToIP(a, 1)
-			continue
-		}
-		log.Functionf("lookupOrAllocateIPv4(%s) found free %s\n",
-			mac.String(), a.String())
-
-		recordIPAssignment(ctx, status, a, mac.String())
-		return a.String(), nil
+	// the address does not fall in the Dhcp Range
+	if !status.DhcpRange.Contains(a) {
+		errStr := fmt.Sprintf("no free IP addresses in DHCP range(%s, %s)",
+			status.DhcpRange.Start.String(),
+			status.DhcpRange.End.String())
+		log.Errorf("lookupOrAllocateIPv4(%s, %s): fail: %s",
+			networkID.String(), appID.String(), errStr)
+		return "", errors.New(errStr)
 	}
-	errStr := fmt.Sprintf("lookupOrAllocateIPv4(%s) no free address in DhcpRange",
-		status.Key())
-	return "", errors.New(errStr)
+	log.Functionf("lookupOrAllocateIPv4(%s-%s): allocated %s for %s\n",
+		networkID.String(), appID.String(), mac.String(), a.String())
+	return a.String(), nil
 }
 
 // recordIPAssigment updates status and publishes the result
 func recordIPAssignment(ctx *zedrouterContext,
 	status *types.NetworkInstanceStatus, ip net.IP, mac string) {
-
 	status.IPAssignments[mac] = ip
-	// Publish the allocation
 	publishNetworkInstanceStatus(ctx, status)
-}
-
-// Add to an IPv4 address
-func addToIP(ip net.IP, addition uint) net.IP {
-	addr := ip.To4()
-	if addr == nil {
-		log.Fatalf("addIP: not an IPv4 address %s", ip.String())
-	}
-	val := uint(addr[0])<<24 + uint(addr[1])<<16 +
-		uint(addr[2])<<8 + uint(addr[3])
-	val += addition
-	val0 := byte((val >> 24) & 0xFF)
-	val1 := byte((val >> 16) & 0xFF)
-	val2 := byte((val >> 8) & 0xFF)
-	val3 := byte(val & 0xFF)
-	return net.IPv4(val0, val1, val2, val3)
 }
 
 // releaseIPv4
@@ -949,6 +911,20 @@ func setBridgeIPAddr(
 		return nil
 	}
 
+	status.BridgeIPAddr = ""
+	if status.Subnet.IP == nil || status.DhcpRange.Start == nil ||
+		status.Gateway == nil {
+		log.Functionf("setBridgeIPAddr: Don't have a IP address for %s\n",
+			status.Key())
+		return nil
+	}
+	ipAddr := status.Gateway.String()
+	if ipAddr == "" {
+		log.Functionf("setBridgeIPAddr: Don't have a IP address for %s\n",
+			status.Key())
+		return nil
+	}
+
 	// Get the linux interface with the attributes.
 	// This is used to add an IP Address below.
 	link, _ := netlink.LinkByName(status.BridgeName)
@@ -959,7 +935,6 @@ func setBridgeIPAddr(
 	}
 	log.Functionf("Bridge: %s, Link: %+v\n", status.BridgeName, link)
 
-	var ipAddr string
 	var err error
 
 	// Assign the gateway Address as the bridge IP address
@@ -976,21 +951,22 @@ func setBridgeIPAddr(
 			status.BridgeName)
 		return errors.New(errStr)
 	}
-	if status.Gateway != nil {
-		ipAddr = status.Gateway.String()
-		status.IPAssignments[bridgeMac.String()] = status.Gateway
-	}
-	log.Functionf("BridgeMac: %s, ipAddr: %s\n",
+	log.Functionf("BridgeMac: %s, ipAddr: %s",
 		bridgeMac.String(), ipAddr)
-	status.BridgeIPAddr = ipAddr
-	publishNetworkInstanceStatus(ctx, status)
-	log.Functionf("Published NetworkStatus. BridgeIpAddr: %s\n",
-		status.BridgeIPAddr)
 
-	if status.BridgeIPAddr == "" {
-		log.Functionf("Does not yet have a bridge IP address for %s\n",
-			status.Key())
-		return nil
+	// outside of subnet, flag it
+	if !status.Subnet.Contains(status.Gateway) {
+		errStr := fmt.Sprintf("Bridge IP(%s) is not in Subnet", ipAddr)
+		log.Errorf("setBridgeIPAddr(%s): fail: %s",
+			status.UUID.String(), errStr)
+		return errors.New(errStr)
+	}
+	// if inside of DhcpRange, flag it
+	if status.DhcpRange.Contains(status.Gateway) {
+		errStr := fmt.Sprintf("Gateway(%s) is in Dhcp Range(%s,%s)",
+			ipAddr, status.DhcpRange.Start.String(),
+			status.DhcpRange.End.String())
+		return errors.New(errStr)
 	}
 
 	prefixLen := getPrefixLenForBridgeIP(status)
@@ -999,6 +975,12 @@ func setBridgeIPAddr(
 		return err
 	}
 
+	status.BridgeIPAddr = ipAddr
+	addr := net.ParseIP(ipAddr)
+	recordIPAssignment(ctx, status, addr, bridgeMac.String())
+	publishNetworkInstanceStatus(ctx, status)
+	log.Functionf("Published NetworkStatus. BridgeIpAddr: %s\n",
+		status.BridgeIPAddr)
 	// Create new radvd configuration and restart radvd if ipv6
 	if status.IsIPv6() {
 		log.Functionf("Restart Radvd\n")
@@ -1026,6 +1008,7 @@ func updateBridgeIPAddr(
 			status.Key())
 		restartDnsmasq(ctx, status)
 	}
+	// TBD:XXX if no ip Addr, we may need to stop the dns
 }
 
 // maybeUpdateBridgeIPAddr
@@ -1304,7 +1287,15 @@ func doNetworkInstanceDelete(
 		}
 		DNSStopMonitor(status.BridgeNum)
 	}
+	if status.BridgeMac != "" {
+		mac, err := net.ParseMAC(status.BridgeMac)
+		if err != nil {
+			log.Fatal("ParseMAC failed: ", status.BridgeMac, err)
+		}
+		releaseIPv4FromNetworkInstance(ctx, status, mac)
+	}
 	networkInstanceBridgeDelete(ctx, status)
+	appNumOnUNetBaseDelete(status.UUID)
 }
 
 func lookupNetworkInstanceConfig(ctx *zedrouterContext, key string) *types.NetworkInstanceConfig {
